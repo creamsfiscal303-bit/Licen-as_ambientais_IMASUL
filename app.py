@@ -500,27 +500,46 @@ def remover_duplicadas(df):
 # ----------------------------------------------------------------------------------------
 # AGENTES FISCAIS (município -> agente), guardado em CSV na pasta dados_fiscalizacao
 # ----------------------------------------------------------------------------------------
+MUNICIPIOS_MS = "Água Clara, Alcinópolis, Amambai, Anastácio, Anaurilândia, Angélica, Antônio João, Aparecida do Taboado, Aquidauana, Aral Moreira, Bandeirantes, Bataguassu, Batayporã, Bela Vista, Bodoquena, Bonito, Brasilândia, Caarapó, Camapuã, Campo Grande, Caracol, Cassilândia, Chapadão do Sul, Corguinho, Coronel Sapucaia, Corumbá, Costa Rica, Coxim, Deodápolis, Dois Irmãos do Buriti, Douradina, Dourados, Eldorado, Fátima do Sul, Figueirão, Glória de Dourados, Guia Lopes da Laguna, Iguatemi, Inocência, Itaporã, Itaquiraí, Ivinhema, Japorã, Jaraguari, Jardim, Jateí, Juti, Ladário, Laguna Carapã, Maracaju, Miranda, Mundo Novo, Naviraí, Nioaque, Nova Alvorada do Sul, Nova Andradina, Novo Horizonte do Sul, Paraíso das Águas, Paranaíba, Paranhos, Pedro Gomes, Ponta Porã, Porto Murtinho, Ribas do Rio Pardo, Rio Brilhante, Rio Negro, Rio Verde de Mato Grosso, Rochedo, Santa Rita do Pardo, São Gabriel do Oeste, Selvíria, Sete Quedas, Sidrolândia, Sonora, Tacuru, Taquarussu, Terenos, Três Lagoas, Vicentina".split(", ")   # os 79 municípios de MS (grafia oficial)
+
+
 def carregar_atribuicoes():
+    """{município normalizado: agente}. A comparação ignora acento, maiúscula e pontuação."""
     if not ARQ_AGENTES.exists():
         return {}
     try:
         t = pd.read_csv(ARQ_AGENTES, sep=";", dtype=str, encoding="utf-8-sig").fillna("")
-        return {m.strip().upper(): a.strip() for m, a in zip(t["municipio"], t["agente"]) if a.strip()}
+        return {norm_texto(m): a.strip() for m, a in zip(t["municipio"], t["agente"]) if m.strip() and a.strip()}
     except Exception:
         return {}
 
 
 def salvar_atribuicoes(mapa):
-    t = pd.DataFrame(sorted(mapa.items()), columns=["municipio", "agente"])
-    t.to_csv(ARQ_AGENTES, sep=";", index=False, encoding="utf-8-sig")
+    """Grava o CSV com a grafia oficial dos municípios (quando reconhecida)."""
+    nomes = {norm_texto(m): m for m in MUNICIPIOS_MS}
+    linhas = sorted(((nomes.get(k, k), a) for k, a in mapa.items()), key=lambda x: norm_texto(x[0]))
+    pd.DataFrame(linhas, columns=["municipio", "agente"]).to_csv(ARQ_AGENTES, sep=";", index=False, encoding="utf-8-sig")
 
 
 def ler_csv_atribuicoes(arquivo):
-    t = pd.read_csv(arquivo, sep=None, engine="python", dtype=str, encoding="utf-8-sig").fillna("")
-    t.columns = [c.strip().lower() for c in t.columns]
-    if not {"municipio", "agente"} <= set(t.columns):
+    """Aceita CSV com colunas municipio e agente (UTF-8 ou Latin-1, separado por ; ou ,)."""
+    conteudo = arquivo.getvalue() if hasattr(arquivo, "getvalue") else open(arquivo, "rb").read()
+    for enc in ("utf-8-sig", "latin-1"):
+        try:
+            t = pd.read_csv(io.BytesIO(conteudo), sep=None, engine="python", dtype=str, encoding=enc).fillna("")
+            break
+        except UnicodeDecodeError:
+            continue
+    t.columns = [norm_texto(c).lower() for c in t.columns]
+    if "municipio" not in t.columns or "agente" not in t.columns:
         raise ValueError("O CSV precisa ter as colunas 'municipio' e 'agente'.")
-    return {m.strip().upper(): a.strip() for m, a in zip(t["municipio"], t["agente"]) if m.strip() and a.strip()}
+    return {norm_texto(m): a.strip() for m, a in zip(t["municipio"], t["agente"]) if m.strip() and a.strip()}
+
+
+def agente_do_municipio(serie_municipios, atrib):
+    """Procura o agente de cada município (calcula uma vez por nome distinto)."""
+    por_nome = {m: atrib.get(norm_texto(m)) for m in serie_municipios.dropna().unique()}
+    return serie_municipios.map(por_nome)
 
 
 # ----------------------------------------------------------------------------------------
@@ -735,7 +754,7 @@ if busca.strip():
 
 atrib = carregar_atribuicoes()
 df = df.copy()
-df["agente"] = df["municipio_norm"].map(atrib).fillna(SEM_AGENTE)
+df["agente"] = agente_do_municipio(df["municipio_norm"], atrib).fillna(SEM_AGENTE)
 estado_art = st.session_state.get("art_conferencia")
 df["situacao_art"] = df["objectid"].map(estado_art["por_objectid"] if estado_art else {}).fillna(S_NAO_CONF)
 assinatura_df = hashlib.md5(",".join(map(str, sorted(df["objectid"]))).encode()).hexdigest()
@@ -781,7 +800,7 @@ with aba_mun:
     por_mun = (df.groupby("municipio_norm")
                  .agg(licencas=("objectid", "size"), area_informada_total=("area_informada", "sum"))
                  .sort_values("licencas", ascending=False).reset_index())
-    por_mun["agente"] = por_mun["municipio_norm"].map(atrib).fillna(SEM_AGENTE)
+    por_mun["agente"] = agente_do_municipio(por_mun["municipio_norm"], atrib).fillna(SEM_AGENTE)
     por_mun["area_informada_total"] = por_mun["area_informada_total"].round(1)
     n_sem = int(por_mun.loc[por_mun["municipio_norm"] == SEM_MUNICIPIO, "licencas"].sum())
     c1, c2 = st.columns(2)
@@ -965,7 +984,7 @@ with aba_agentes:
 
     editor_base = (df.groupby("municipio_norm").size().sort_values(ascending=False).rename("licencas").reset_index())
     editor_base = editor_base[editor_base["municipio_norm"] != SEM_MUNICIPIO]
-    editor_base["agente"] = editor_base["municipio_norm"].map(atrib).fillna("")
+    editor_base["agente"] = agente_do_municipio(editor_base["municipio_norm"], atrib).fillna("")
     editor_base = editor_base.rename(columns={"municipio_norm": "municipio"})
     opcoes_agente = [""] + sorted(set(lista_agentes) | set(editor_base["agente"]) - {""})
     editado = st.data_editor(
@@ -977,13 +996,18 @@ with aba_agentes:
         novo_mapa = dict(atrib)
         for mun, ag in zip(editado["municipio"], editado["agente"]):
             if ag and str(ag).strip():
-                novo_mapa[mun] = str(ag).strip()
+                novo_mapa[norm_texto(mun)] = str(ag).strip()
             else:
-                novo_mapa.pop(mun, None)
+                novo_mapa.pop(norm_texto(mun), None)
         salvar_atribuicoes(novo_mapa)
         st.success("Atribuição salva.")
         st.rerun()
 
+    canon = {norm_texto(m) for m in MUNICIPIOS_MS}
+    fora_da_lista = sorted(m for m in df["municipio_norm"].unique() if m != SEM_MUNICIPIO and norm_texto(m) not in canon)
+    if fora_da_lista:
+        st.warning("Municípios do IMASUL com grafia que não bate com a lista oficial de MS (não receberão agente): "
+                   + ", ".join(fora_da_lista[:15]))
     sem_agente = df[df["agente"] == SEM_AGENTE]
     if len(sem_agente):
         st.warning(f"{len(sem_agente):,} licença(s) em {sem_agente['municipio_norm'].nunique():,} município(s) ainda sem agente.")
