@@ -1,14 +1,16 @@
 """
-Fiscalização de PLANTIO FLORESTAL — IMASUL / CREA-MS (v3: mapa, agentes e rotas)
+Fiscalização de PLANTIO FLORESTAL — IMASUL / CREA-MS (v4: mapa, agentes, rotas e conferência de ART)
 
 Fonte: camada "licencas_ambientais" (layer 16) do IMASUL, que traz tipo de empreendimento,
 detentor, CNPJ, imóvel, município, datas e a geometria dos imóveis.
 
-Fluxo: filtros (lateral) -> baixar dados -> abas: Dados | Por município | Mapa | Agentes e rotas
+Fluxo: filtros (lateral) -> baixar dados -> abas: Dados | Por município | Mapa | Conferência de ART | Agentes e rotas
 """
+import hashlib
 import io
 import json
 import re
+import unicodedata
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -201,8 +203,203 @@ def montar_rota(df_agente, municipio_base, pontos_por_dia):
 COLUNAS_ROTA = [
     "ordem", "dia", "municipio", "num_autorizacao", "num_processo", "tipo_empreendimento",
     "nome_detentor", "cnpj", "nome_imovel", "data_expedicao", "validade_licenca", "data_validade",
-    "status_licenca", "area_informada", "sicar", "lat", "lon", "km_da_parada_anterior", "link_google_maps",
+    "status_licenca", "situacao_art", "area_informada", "sicar", "lat", "lon", "km_da_parada_anterior", "link_google_maps",
 ]
+
+
+# ----------------------------------------------------------------------------------------
+# CONFERÊNCIA DE ART (Decisão CEA/MS 1333/2015)
+# Unidade de conferência = "empreendimento": mesmo CPF/CNPJ no mesmo município, no ano de referência.
+# O resultado é INDÍCIO para priorizar vistoria, nunca conclusão.
+# ----------------------------------------------------------------------------------------
+S_OK = "Com ART no ano"
+S_POSS = "Possível ART (conferir)"
+S_OUTRO_MUN = "ART em outro município"
+S_OUTRO_ANO = "ART só em outros anos"
+S_SEM = "Sem ART localizada"
+S_NAO_VERIF = "Não verificável (sem CPF/CNPJ)"
+S_NAO_CONF = "(não conferida)"
+ORDEM_STATUS = [S_SEM, S_OUTRO_MUN, S_OUTRO_ANO, S_POSS, S_NAO_VERIF, S_OK, S_NAO_CONF]
+CORES_STATUS = {
+    S_OK: [46, 160, 67], S_POSS: [240, 200, 0], S_OUTRO_MUN: [245, 130, 48], S_OUTRO_ANO: [160, 90, 200],
+    S_SEM: [215, 25, 28], S_NAO_VERIF: [110, 110, 110], S_NAO_CONF: [190, 190, 190],
+}
+
+
+def sem_acentos(txt):
+    return "".join(c for c in unicodedata.normalize("NFD", str(txt)) if unicodedata.category(c) != "Mn")
+
+
+def norm_texto(valor):
+    """MAIÚSCULAS, sem acento e sem pontuação: 'Três Lagoas' -> 'TRES LAGOAS'."""
+    if valor is None or pd.isna(valor):
+        return ""
+    return re.sub(r"[^A-Z0-9]+", " ", sem_acentos(valor).upper()).strip()
+
+
+def norm_doc(valor):
+    """Só os dígitos do CPF (11) ou CNPJ (14). Vazio se estiver mascarado ou incompleto."""
+    if valor is None or pd.isna(valor):
+        return ""
+    t = str(valor).strip()
+    if "*" in t:
+        return ""
+    d = re.sub(r"\D", "", re.sub(r"\.0+$", "", t))
+    if len(d) in (9, 10):
+        d = d.zfill(11)      # Excel costuma comer o zero à esquerda
+    elif len(d) in (12, 13):
+        d = d.zfill(14)
+    return d if len(d) in (11, 14) else ""
+
+
+SEM_MUN_KEY = norm_texto(SEM_MUNICIPIO)
+
+
+def extrair_ano(serie):
+    """Aceita datas (dd/mm/aaaa, aaaa-mm-dd...) ou uma coluna que já seja só o ano."""
+    s = serie.astype(str).str.strip()
+    ano = pd.to_numeric(s.where(s.str.fullmatch(r"(19|20)\d{2}")), errors="coerce")
+    datas = pd.to_datetime(s.where(ano.isna()), dayfirst=True, errors="coerce", format="mixed")
+    return ano.fillna(datas.dt.year)
+
+
+@st.cache_data(show_spinner=False)
+def ler_planilha(conteudo, nome):
+    """Devolve {nome da aba: DataFrame}. Tudo como texto, para não perder zeros de CPF/CNPJ."""
+    if nome.lower().endswith(".csv"):
+        for enc in ("utf-8-sig", "latin-1"):
+            try:
+                return {"CSV": pd.read_csv(io.BytesIO(conteudo), sep=None, engine="python", dtype=str, encoding=enc)}
+            except UnicodeDecodeError:
+                continue
+        raise ValueError("Não consegui ler o CSV (codificação desconhecida).")
+    return pd.read_excel(io.BytesIO(conteudo), sheet_name=None, dtype=str)
+
+
+def adivinhar_coluna(colunas, palavras):
+    """Posição (começando em 1; 0 = nenhuma) da primeira coluna cujo nome contém alguma palavra."""
+    normais = [norm_texto(c) for c in colunas]
+    for p in palavras:
+        for i, c in enumerate(normais):
+            if norm_texto(p) in c:
+                return i + 1
+    return 0
+
+
+def preparar_arts(tab, col_doc, col_nome, col_mun, col_data, col_ativ, incluir=(), excluir=(), col_num=None):
+    a = pd.DataFrame(index=tab.index)
+    a["doc"] = tab[col_doc].map(norm_doc) if col_doc else ""
+    a["nome_norm"] = tab[col_nome].map(norm_texto) if col_nome else ""
+    a["mun_key"] = tab[col_mun].map(norm_texto) if col_mun else ""
+    a["ano"] = extrair_ano(tab[col_data]) if col_data else np.nan
+    a["ativ"] = tab[col_ativ].map(norm_texto) if col_ativ else ""
+    texto = lambda col: tab[col].fillna("").astype(str).str.strip() if col else ""
+    a["num"], a["nome_orig"], a["mun_orig"] = texto(col_num), texto(col_nome), texto(col_mun)
+    info = {"linhas_lidas": len(tab)}
+    incluir = [norm_texto(x) for x in incluir if norm_texto(x)]
+    excluir = [norm_texto(x) for x in excluir if norm_texto(x)]
+    if col_ativ and incluir:
+        ok = a["ativ"].apply(lambda t: any(p in t for p in incluir))
+        info["descartadas_fora_do_filtro"] = int((~ok).sum())
+        a = a[ok]
+    if col_ativ and excluir:
+        ruim = a["ativ"].apply(lambda t: any(p in t for p in excluir))
+        info["descartadas_por_exclusao"] = int(ruim.sum())
+        a = a[~ruim]
+    info["arts_consideradas"] = len(a)
+    info["sem_ano_valido"] = int(a["ano"].isna().sum())
+    info["sem_cpf_cnpj_valido"] = int((a["doc"] == "").sum())
+    return a, info
+
+
+def montar_empreendimentos(df):
+    """Agrupa as licenças por (CPF/CNPJ ou nome do detentor) + município."""
+    t = df.copy()
+    t["doc"] = t["cnpj"].map(norm_doc)
+    t["nome_norm"] = t["nome_detentor"].map(norm_texto)
+    t["mun_key"] = t["municipio_norm"].map(norm_texto)
+    t["chave"] = np.where(t["doc"] != "", "DOC:" + t["doc"],
+                          np.where(t["nome_norm"] != "", "NOME:" + t["nome_norm"], "OBJ:" + t["objectid"].astype(str)))
+    primeiro_nome = lambda s: next((x for x in s if isinstance(x, str) and x.strip()), "")
+    g = t.groupby(["chave", "mun_key"], sort=False).agg(
+        doc=("doc", "first"), nome_norm=("nome_norm", "first"), detentor=("nome_detentor", primeiro_nome),
+        municipio=("municipio_norm", "first"), agente=("agente", "first"), licencas=("objectid", "size"),
+        area_informada_total=("area_informada", "sum"), tipo_empreendimento=("tipo_empreendimento", "first"),
+        lat=("lat", "mean"), lon=("lon", "mean"), objectids=("objectid", list),
+    ).reset_index().drop(columns="chave")
+    g["area_informada_total"] = g["area_informada_total"].round(1)
+    return g
+
+
+def conferir_arts(emp, art, ano_ref, usar_raiz=False):
+    """Para cada empreendimento devolve situação, observação e a ART encontrada (evidência para o agente)."""
+    def kd(d):
+        return d[:8] if (usar_raiz and len(d) == 14) else d
+
+    art_ano = art[art["ano"] == ano_ref]
+    doc_mun_ano, doc_ano, nome_mun_ano, nome_ano = {}, {}, {}, {}
+    for r in art_ano.itertuples():
+        ev = (r.num, r.nome_orig, r.doc, r.mun_orig)
+        if r.doc:
+            doc_mun_ano.setdefault((kd(r.doc), r.mun_key), ev)
+            doc_ano.setdefault(kd(r.doc), ev)
+        if r.nome_norm:
+            nome_mun_ano.setdefault((r.nome_norm, r.mun_key), ev)
+            nome_ano.setdefault(r.nome_norm, ev)
+    doc_todos = {kd(d) for d in art["doc"] if d}
+    vazio = ("", "", "", "")
+
+    saida = []
+    for doc, nome, mun in zip(emp["doc"], emp["nome_norm"], emp["mun_key"]):
+        d = kd(doc) if doc else ""
+        sem_mun = mun in ("", SEM_MUN_KEY)
+        if d and not sem_mun and (d, mun) in doc_mun_ano:
+            saida.append((S_OK, "CPF/CNPJ e município encontrados em ART do ano.", *doc_mun_ano[(d, mun)]))
+        elif nome and not sem_mun and (nome, mun) in nome_mun_ano:
+            saida.append((S_POSS, "ART do ano com mesmo nome e município; CPF/CNPJ ausente ou diferente. Conferir.",
+                          *nome_mun_ano[(nome, mun)]))
+        elif sem_mun and d and d in doc_ano:
+            saida.append((S_POSS, "Há ART do ano para este CPF/CNPJ, mas a licença não informa o município.", *doc_ano[d]))
+        elif sem_mun and nome and nome in nome_ano:
+            saida.append((S_POSS, "Há ART do ano com este nome, mas a licença não informa o município.", *nome_ano[nome]))
+        elif d and d in doc_ano:
+            saida.append((S_OUTRO_MUN, "Há ART do ano com o mesmo CPF/CNPJ, mas em outro município "
+                                       "(a Decisão 1333 pede uma ART por município).", *doc_ano[d]))
+        elif d and d in doc_todos:
+            saida.append((S_OUTRO_ANO, "Há ART com este CPF/CNPJ apenas em outros anos.", *vazio))
+        elif d:
+            saida.append((S_SEM, "Nenhuma ART com este CPF/CNPJ na planilha enviada.", *vazio))
+        else:
+            saida.append((S_NAO_VERIF, "A licença não informa CPF/CNPJ do detentor e nenhuma ART bate pelo nome.", *vazio))
+    return pd.DataFrame(saida, index=emp.index, columns=[
+        "situacao_art", "observacao", "art_numero", "art_contratante", "art_cpf_cnpj", "art_municipio"])
+
+
+def executar_conferencia(df, art, ano_ref, usar_raiz=False):
+    emp = montar_empreendimentos(df)
+    res = conferir_arts(emp, art, ano_ref, usar_raiz)
+    emp = pd.concat([emp, res], axis=1)
+    por_objectid = {}
+    for oids, situacao in zip(emp["objectids"], emp["situacao_art"]):
+        for o in oids:
+            por_objectid[o] = situacao
+    return emp, por_objectid
+
+
+def emp_para_exportar(emp, incluir_doc_art=True):
+    t = emp.copy()
+    t["situacao_art"] = pd.Categorical(t["situacao_art"], categories=ORDEM_STATUS, ordered=True)
+    t = t.sort_values(["situacao_art", "licencas"], ascending=[True, False])
+    t["lat"], t["lon"] = t["lat"].round(6), t["lon"].round(6)
+    t["link_google_maps"] = [f"https://www.google.com/maps?q={a:.6f},{b:.6f}" if pd.notna(a) else ""
+                             for a, b in zip(t["lat"], t["lon"])]
+    t = t.rename(columns={"doc": "cpf_cnpj"})
+    cols = ["situacao_art", "observacao", "art_numero", "art_contratante", "art_cpf_cnpj", "art_municipio",
+            "cpf_cnpj", "detentor", "municipio", "agente", "licencas",
+            "area_informada_total", "tipo_empreendimento", "lat", "lon", "link_google_maps"]
+    if not incluir_doc_art:
+        cols.remove("art_cpf_cnpj")
+    return t[[c for c in cols if c in t.columns]].astype({"situacao_art": str})
 
 
 # ----------------------------------------------------------------------------------------
@@ -353,7 +550,7 @@ def formatar_planilha(writer, colunas_data=COLUNAS_DATA):
                     linha[0].number_format = "DD/MM/YYYY"
 
 
-def meta_df(where, total_servidor, linhas_brutas, linhas_arquivo):
+def meta_df(where, total_servidor, linhas_brutas, linhas_arquivo, extras=None):
     return pd.DataFrame([
         ["Fonte", "IMASUL - camada licencas_ambientais (imóveis rurais)"],
         ["Serviço ArcGIS REST", LAYER_URL],
@@ -364,7 +561,7 @@ def meta_df(where, total_servidor, linhas_brutas, linhas_arquivo):
         ["Linhas no arquivo", linhas_arquivo],
         ["Coordenadas", "Ponto central aproximado do imóvel (SIRGAS 2000/WGS84). Distâncias em linha reta, não por estrada."],
         ["Observação", "Dados públicos do serviço consultado. Confirmar na fonte oficial antes de uso em procedimento fiscalizatório."],
-    ], columns=["Item", "Informação"])
+    ] + (extras or []), columns=["Item", "Informação"])
 
 
 @st.cache_data(show_spinner="Gerando Excel...")
@@ -403,23 +600,25 @@ def cores_dos_agentes(agentes):
     return {a: PALETA[i % len(PALETA)] for i, a in enumerate(sorted(agentes))}
 
 
-def preparar_para_mapa(df, cores):
+def preparar_para_mapa(df, cores, coluna="agente"):
     m = df.dropna(subset=["lat", "lon"]).copy()
-    m["cor"] = m["agente"].map(lambda a: cores.get(a, COR_SEM_AGENTE))
+    m["cor"] = m[coluna].map(lambda a: cores.get(a, COR_SEM_AGENTE))
+    if "situacao_art" not in m.columns:
+        m["situacao_art"] = ""
     for c in ["nome_detentor", "nome_imovel", "municipio_norm", "num_autorizacao", "status_licenca",
-              "validade_licenca", "agente"]:
+              "validade_licenca", "agente", "situacao_art"]:
         m[c] = m[c].fillna("").astype(str)
     m["tipo_curto"] = m["tipo_empreendimento"].fillna("").astype(str).str.slice(0, 70)
     m["expedicao"] = m["data_expedicao"].astype(str).replace("NaT", "")
     m["lat"], m["lon"] = m["lat"].astype(float), m["lon"].astype(float)
     return m[["lon", "lat", "cor", "agente", "municipio_norm", "nome_detentor", "nome_imovel",
-              "num_autorizacao", "tipo_curto", "expedicao", "status_licenca", "validade_licenca"]]
+              "num_autorizacao", "tipo_curto", "expedicao", "status_licenca", "validade_licenca", "situacao_art"]]
 
 
 TOOLTIP = {
     "html": "<b>{municipio_norm}</b><br/>{nome_detentor}<br/>Imóvel: {nome_imovel}<br/>"
             "Licença: {num_autorizacao} ({status_licenca})<br/>{tipo_curto}<br/>"
-            "Expedição: {expedicao} · {validade_licenca}<br/>Agente: {agente}",
+            "Expedição: {expedicao} · {validade_licenca}<br/>Agente: {agente}<br/>ART: {situacao_art}",
     "style": {"backgroundColor": "#222", "color": "white", "fontSize": "12px"},
 }
 
@@ -537,6 +736,9 @@ if busca.strip():
 atrib = carregar_atribuicoes()
 df = df.copy()
 df["agente"] = df["municipio_norm"].map(atrib).fillna(SEM_AGENTE)
+estado_art = st.session_state.get("art_conferencia")
+df["situacao_art"] = df["objectid"].map(estado_art["por_objectid"] if estado_art else {}).fillna(S_NAO_CONF)
+assinatura_df = hashlib.md5(",".join(map(str, sorted(df["objectid"]))).encode()).hexdigest()
 
 sem_coord = int(df["lat"].isna().sum())
 if sem_coord:
@@ -544,7 +746,8 @@ if sem_coord:
 if resultado.get("modo") == "geometria":
     st.caption("ℹ️ O servidor não devolveu o ponto central; ele foi calculado a partir da forma simplificada do imóvel.")
 
-aba_dados, aba_mun, aba_mapa, aba_agentes = st.tabs(["📋 Dados", "📊 Por município", "🗺️ Mapa", "👮 Agentes e rotas"])
+aba_dados, aba_mun, aba_mapa, aba_art, aba_agentes = st.tabs(
+    ["📋 Dados", "📊 Por município", "🗺️ Mapa", "🧾 Conferência de ART", "👮 Agentes e rotas"])
 
 # ------------------------------------------------------------------ DADOS
 with aba_dados:
@@ -594,17 +797,152 @@ with aba_mun:
 # ------------------------------------------------------------------ MAPA
 with aba_mapa:
     agentes_existentes = sorted(set(df["agente"]))
-    cores = cores_dos_agentes([a for a in agentes_existentes if a != SEM_AGENTE])
-    cA, cB = st.columns([1, 2])
-    modo_mapa = cA.radio("Visualização", ["Pontos", "Mapa de calor"], horizontal=True)
-    agentes_mapa = cB.multiselect("Agentes no mapa", agentes_existentes, default=agentes_existentes)
-    mapa_df = preparar_para_mapa(df[df["agente"].isin(agentes_mapa)], cores)
-    st.caption(f"{len(mapa_df):,} pontos. Cada ponto é o centro aproximado do imóvel licenciado; cor = agente responsável pelo município.")
+    cores_agente = cores_dos_agentes([a for a in agentes_existentes if a != SEM_AGENTE])
+    cA, cB, cC = st.columns([1, 1, 2])
+    modo_mapa = cA.radio("Visualização", ["Pontos", "Mapa de calor"], horizontal=False)
+    opcoes_cor = ["Agente"] + (["Situação da ART"] if estado_art else [])
+    colorir_por = cB.radio("Colorir por", opcoes_cor, horizontal=False)
+    agentes_mapa = cC.multiselect("Agentes no mapa", agentes_existentes, default=agentes_existentes)
+    if colorir_por == "Situação da ART":
+        coluna_cor, cores_mapa = "situacao_art", CORES_STATUS
+        presentes = [s for s in ORDEM_STATUS if s in set(df["situacao_art"])]
+    else:
+        coluna_cor, cores_mapa = "agente", cores_agente
+        presentes = list(cores_agente)
+    mapa_df = preparar_para_mapa(df[df["agente"].isin(agentes_mapa)], cores_mapa, coluna_cor)
+    st.caption(f"{len(mapa_df):,} pontos. Cada ponto é o centro aproximado do imóvel licenciado.")
     desenhar_mapa(mapa_df, modo_mapa)
-    if len(cores):
-        st.markdown(" ".join(
-            f"<span style='color:rgb({c[0]},{c[1]},{c[2]})'>●</span> {a}" for a, c in cores.items()
-        ), unsafe_allow_html=True)
+    st.markdown(" ".join(
+        f"<span style='color:rgb({cores_mapa[a][0]},{cores_mapa[a][1]},{cores_mapa[a][2]})'>●</span> {a}"
+        for a in presentes if a in cores_mapa
+    ), unsafe_allow_html=True)
+
+# ------------------------------------------------------------------ CONFERÊNCIA DE ART
+with aba_art:
+    st.subheader("Conferência de ART — Decisão CEA/MS nº 1333/2015")
+    with st.expander("Regra aplicada e limites desta conferência"):
+        st.markdown(
+            "**O que a Decisão 1333/2015 determina (resumo):**\n"
+            "- Uma ART individualizada **por contrato** de prestação de serviços na cultura florestal e **por CPF ou CNPJ**, "
+            "desde que as áreas do contrato (contíguas ou não) estejam **no mesmo município e comarca**.\n"
+            "- Essa ART pode abranger todas as atividades florestais: preparo de solo, plantio, tratos culturais, corte, "
+            "carregamento e transporte.\n"
+            "- **Viveiro de mudas** exige ART exclusiva; **inventário florestal e serviços ambientais** têm ARTs separadas.\n"
+            "- Recolhimento de 1º a 31 de janeiro, com validade até 31 de dezembro do mesmo ano.\n"
+            "- Vale para empresas do setor florestal, fornecedores de madeira e prestadores de serviço.\n\n"
+            "**Como o app confere:** agrupa as licenças por CPF/CNPJ do detentor + município (um *empreendimento*) "
+            "e procura, na planilha, ART do **ano de referência** com o mesmo CPF/CNPJ e município.\n\n"
+            "**Limites:** (1) a licença do IMASUL traz CNPJ, mas **não traz CPF** — produtor pessoa física só é "
+            "conferido por nome; (2) o detentor da licença nem sempre é quem executa a obra (ex.: dono da terra que "
+            "arrenda para empresa florestal), e a decisão trata de quem executa; (3) nomes, CNPJ de matriz/filial e "
+            "grafia de município podem divergir. Por isso o resultado é **indício para priorizar vistoria**, nunca conclusão."
+        )
+    arq_art = st.file_uploader("Planilha de ARTs (CSV ou XLSX)", type=["csv", "xlsx"], key="upload_art")
+    if arq_art is None:
+        st.info("Envie a planilha de ARTs exportada do sistema do CREA-MS. Depois você indica qual coluna é qual.")
+    else:
+        try:
+            folhas = ler_planilha(arq_art.getvalue(), arq_art.name)
+        except Exception as exc:
+            folhas = {}
+            st.error(f"Não foi possível ler a planilha: {exc}")
+        if folhas:
+            nome_folha = st.selectbox("Aba da planilha", list(folhas)) if len(folhas) > 1 else next(iter(folhas))
+            tab_art = folhas[nome_folha]
+            st.caption(f"{len(tab_art):,} linhas · {len(tab_art.columns)} colunas")
+            st.dataframe(tab_art.head(5), use_container_width=True, hide_index=True)
+            colunas = list(tab_art.columns)
+            nenhuma = "(nenhuma)"
+
+            def seletor(rotulo, palavras, ajuda=None):
+                return st.selectbox(rotulo, [nenhuma] + colunas, index=adivinhar_coluna(colunas, palavras), help=ajuda)
+
+            st.markdown("**Quais colunas da planilha são estas?** (o app tenta adivinhar; confira)")
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                c_doc = seletor("CPF/CNPJ do contratante", ["CPF CNPJ", "CNPJ", "CPF", "DOCUMENTO"],
+                                "Principal chave de comparação. Se estiver mascarado (***), não serve.")
+                c_nome = seletor("Nome do contratante", ["NOME CONTRATANTE", "NOME", "RAZAO", "CONTRATANTE"])
+            with k2:
+                c_mun = seletor("Município da obra/serviço", ["MUNICIPIO OBRA", "MUNICIPIO", "CIDADE"])
+                c_data = seletor("Data (ou ano) da ART", ["DATA REGISTRO", "DATA DE REGISTRO", "DATA", "ANO"],
+                                 "Usada para saber o ano da ART.")
+            with k3:
+                c_ativ = seletor("Atividade / descrição (opcional)", ["ATIVIDADE", "DESCRICAO", "OBRA SERVICO"],
+                                 "Permite descartar ARTs de viveiro ou inventário e manter só as florestais.")
+                c_num = seletor("Número da ART (opcional)", ["NUMERO ART", "N ART", "NUM ART", "ART"],
+                                "Aparece no resultado para o agente conferir a ART encontrada.")
+            p1, p2, p3 = st.columns(3)
+            ano_ref = p1.selectbox("Ano de referência", list(range(ANO_MAX, 2014, -1)))
+            usar_raiz = p2.checkbox("Aceitar matriz/filial (8 primeiros dígitos do CNPJ)", value=False,
+                                    help="Desligado = segue a decisão ao pé da letra (CNPJ próprio e individual).")
+            txt_incluir = p3.text_input("Só considerar ARTs cuja atividade contenha (vírgula; vazio = todas)", value="",
+                                        disabled=(c_ativ == nenhuma))
+            txt_excluir = st.text_input("Desconsiderar ARTs cuja atividade contenha (vírgula)", value="VIVEIRO, INVENTARIO",
+                                        disabled=(c_ativ == nenhuma),
+                                        help="Pela Decisão 1333, viveiro e inventário têm ART própria e não cobrem a produção florestal.")
+            if c_ativ != nenhuma:
+                with st.expander("Ver valores mais comuns da coluna de atividade (ajuda a escolher as palavras)"):
+                    st.dataframe(tab_art[c_ativ].fillna("").value_counts().head(25).rename("ARTs").reset_index(),
+                                 hide_index=True, use_container_width=True)
+            faltando = [n for n, c in [("CPF/CNPJ", c_doc), ("município", c_mun), ("data/ano", c_data)] if c == nenhuma]
+            if faltando:
+                st.warning("Sem " + ", ".join(faltando) + " a conferência fica fraca ou impossível. Indique essas colunas se existirem.")
+            if st.button("🔍 Conferir ARTs", type="primary", disabled=(c_data == nenhuma or (c_doc == nenhuma and c_nome == nenhuma))):
+                art_prep, info_art = preparar_arts(
+                    tab_art, None if c_doc == nenhuma else c_doc, None if c_nome == nenhuma else c_nome,
+                    None if c_mun == nenhuma else c_mun, None if c_data == nenhuma else c_data,
+                    None if c_ativ == nenhuma else c_ativ,
+                    [x.strip() for x in txt_incluir.split(",") if x.strip()],
+                    [x.strip() for x in txt_excluir.split(",") if x.strip()],
+                    col_num=None if c_num == nenhuma else c_num,
+                )
+                emp_res, por_objectid = executar_conferencia(df, art_prep, ano_ref, usar_raiz)
+                st.session_state["art_conferencia"] = {
+                    "emp": emp_res, "por_objectid": por_objectid, "ano": ano_ref, "arquivo": arq_art.name,
+                    "info": info_art, "assinatura": assinatura_df, "raiz": usar_raiz,
+                }
+                st.rerun()
+
+    estado = st.session_state.get("art_conferencia")
+    if estado:
+        st.divider()
+        st.markdown(f"### Resultado — ART de {estado['ano']} · arquivo `{estado['arquivo']}`")
+        if estado["assinatura"] != assinatura_df:
+            st.warning("Os filtros mudaram desde esta conferência. Clique em 'Conferir ARTs' de novo para atualizar.")
+        i = estado["info"]
+        st.caption(f"{i['linhas_lidas']:,} linhas lidas · {i['arts_consideradas']:,} ARTs consideradas · "
+                   f"{i['sem_ano_valido']:,} sem ano válido · {i['sem_cpf_cnpj_valido']:,} sem CPF/CNPJ válido"
+                   + (f" · {i['descartadas_por_exclusao']:,} descartadas (viveiro/inventário)" if 'descartadas_por_exclusao' in i else ""))
+        emp = estado["emp"]
+        resumo = (emp.groupby("situacao_art").agg(empreendimentos=("licencas", "size"), licencas=("licencas", "sum"))
+                     .reindex([s for s in ORDEM_STATUS if s in set(emp["situacao_art"])]).reset_index()
+                     .rename(columns={"situacao_art": "situação"}))
+        r1, r2 = st.columns([1, 2])
+        r1.dataframe(resumo, hide_index=True, use_container_width=True)
+        cruz = pd.crosstab(emp["agente"], emp["situacao_art"]).reindex(columns=[s for s in ORDEM_STATUS if s in set(emp["situacao_art"])])
+        r2.markdown("**Empreendimentos por agente e situação**")
+        r2.dataframe(cruz, use_container_width=True)
+        f1, f2 = st.columns(2)
+        sit_ver = f1.multiselect("Situação", [s for s in ORDEM_STATUS if s in set(emp["situacao_art"])],
+                                 default=[s for s in (S_SEM, S_OUTRO_MUN, S_OUTRO_ANO, S_POSS) if s in set(emp["situacao_art"])])
+        ag_ver = f2.multiselect("Agente", sorted(set(emp["agente"])), default=sorted(set(emp["agente"])))
+        incl_doc = st.checkbox("Mostrar CPF/CNPJ da ART encontrada no resultado e no Excel", value=True,
+                               help="Desmarque se o arquivo for circular fora da fiscalização (dado pessoal, LGPD).")
+        tabela_emp = emp_para_exportar(emp, incl_doc)
+        tabela_emp = tabela_emp[tabela_emp["situacao_art"].isin(sit_ver) & tabela_emp["agente"].isin(ag_ver)]
+        st.dataframe(tabela_emp, hide_index=True, use_container_width=True, height=380)
+        lic_export = df.drop(columns=["municipio_norm"])
+        extras = [["Conferência de ART", f"Decisão CEA/MS 1333/2015 · ano {estado['ano']} · arquivo {estado['arquivo']} · "
+                                          f"matriz/filial {'aceita' if estado['raiz'] else 'não aceita'}"],
+                  ["Aviso", "Situação de ART é INDÍCIO para priorizar vistoria. Confirmar no sistema do CREA antes de qualquer ato."]]
+        st.download_button(
+            "⬇️ Baixar conferência (Excel)",
+            data=excel_abas({"Empreendimentos": emp_para_exportar(emp, incl_doc), "Licencas": lic_export}, resumo,
+                            meta_df(where, resultado["total"], brutas, len(lic_export), extras)),
+            file_name=f"conferencia_art_{estado['ano']}_{datetime.now():%Y%m%d_%H%M}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.caption("Dica: na aba 'Mapa' escolha 'Colorir por: Situação da ART' e, em 'Agentes e rotas', filtre o roteiro por situação.")
 
 # ------------------------------------------------------------------ AGENTES E ROTAS
 with aba_agentes:
@@ -652,13 +990,20 @@ with aba_agentes:
 
     st.divider()
     st.subheader("2) Roteiro de visitas por agente")
-    agentes_com_dados = sorted(a for a in set(df["agente"]) if a != SEM_AGENTE)
+    df_rota = df
+    if estado_art:
+        presentes_art = [s for s in ORDEM_STATUS if s in set(df["situacao_art"])]
+        padrao_art = [s for s in (S_SEM, S_OUTRO_MUN, S_OUTRO_ANO, S_POSS) if s in presentes_art] or presentes_art
+        sit_rota = st.multiselect("Roteiro só com licenças nesta situação de ART", presentes_art, default=padrao_art,
+                                  help="Vem da aba 'Conferência de ART'. Deixe todas marcadas para ignorar o filtro.")
+        df_rota = df[df["situacao_art"].isin(sit_rota)]
+    agentes_com_dados = sorted(a for a in set(df_rota["agente"]) if a != SEM_AGENTE)
     if not agentes_com_dados:
         st.info("Atribua ao menos um município a um agente (acima) para montar os roteiros.")
     else:
         r1, r2, r3 = st.columns(3)
         agente_sel = r1.selectbox("Agente", agentes_com_dados)
-        dados_agente = df[df["agente"] == agente_sel]
+        dados_agente = df_rota[df_rota["agente"] == agente_sel]
         municipios_agente = dados_agente["municipio_norm"].value_counts().index.tolist()
         base_sel = r2.selectbox("Município-base (ponto de partida)", municipios_agente)
         por_dia = r3.number_input("Visitas por dia", min_value=1, max_value=50, value=8)
@@ -673,7 +1018,7 @@ with aba_agentes:
             k4.metric("Km em linha reta", f"{rota['km_da_parada_anterior'].sum():,.0f}")
             st.caption("Ordem: municípios do mais próximo ao mais distante a partir da base; dentro de cada município, "
                        "sempre a próxima licença mais próxima. Distâncias em LINHA RETA — não consideram estradas.")
-            rota_map = preparar_para_mapa(rota, cores)
+            rota_map = preparar_para_mapa(rota, cores_agente)
             rota_map["agente"] = rota_map["agente"] + " · visita " + rota["ordem"].astype(str) + " · dia " + rota["dia"].astype(str)
             desenhar_mapa(rota_map, "Pontos", rota=rota)
             saida = rota_para_exportar(rota)
@@ -694,7 +1039,7 @@ with aba_agentes:
             with st.spinner("Montando roteiros..."):
                 abas, resumo = {}, []
                 for ag in agentes_com_dados:
-                    g = df[df["agente"] == ag]
+                    g = df_rota[df_rota["agente"] == ag]
                     rt, base_ag = montar_rota(g, g["municipio_norm"].value_counts().index[0], por_dia)
                     if rt.empty:
                         continue
